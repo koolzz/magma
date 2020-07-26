@@ -39,6 +39,7 @@ import aioeventlet
 from lte.protos.mconfig.mconfigs_pb2 import PipelineD
 from lte.protos.mobilityd_pb2_grpc import MobilityServiceStub
 from lte.protos.session_manager_pb2_grpc import LocalSessionManagerStub
+from orc8r.protos.directoryd_pb2_grpc import GatewayDirectoryServiceStub
 from magma.pipelined.app.base import ControllerType
 from magma.pipelined.app import of_rest_server
 from magma.pipelined.app.access_control import AccessControlController
@@ -481,9 +482,12 @@ class ServiceManager:
             'sessiond', ServiceRegistry.LOCAL)
         mobilityd_chan = ServiceRegistry.get_rpc_channel(
             'mobilityd', ServiceRegistry.LOCAL)
+        directoryd_chan = ServiceRegistry.get_rpc_channel(
+            'directoryd', ServiceRegistry.LOCAL)
         contexts['rpc_stubs'] = {
             'mobilityd': MobilityServiceStub(mobilityd_chan),
             'sessiond': LocalSessionManagerStub(sessiond_chan),
+            'directoryd': GatewayDirectoryServiceStub(directoryd_chan),
         }
 
         # Instantiate and schedule apps

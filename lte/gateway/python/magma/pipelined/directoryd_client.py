@@ -21,17 +21,19 @@ DEFAULT_GRPC_TIMEOUT = 10
 IPV4_ADDR_KEY = "ipv4_addr"
 
 
-def update_record(imsi: str, ip_addr: str) -> None:
+def update_record(imsi: str, ip_addr: str, client=None) -> None:
     """
     Make RPC call to 'UpdateRecord' method of local directoryD service
     """
-    try:
-        chan = ServiceRegistry.get_rpc_channel(DIRECTORYD_SERVICE_NAME,
-                                               ServiceRegistry.LOCAL)
-    except ValueError:
-        logging.error('Cant get RPC channel to %s', DIRECTORYD_SERVICE_NAME)
-        return
-    client = GatewayDirectoryServiceStub(chan)
+
+    if not client:
+        try:
+            chan = ServiceRegistry.get_rpc_channel(DIRECTORYD_SERVICE_NAME,
+                                                   ServiceRegistry.LOCAL)
+        except ValueError:
+            logging.error('Cant get RPC channel to %s', DIRECTORYD_SERVICE_NAME)
+            return
+        client = GatewayDirectoryServiceStub(chan)
     if not imsi.startswith("IMSI"):
         imsi = "IMSI" + imsi
     try:

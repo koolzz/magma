@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 """
 import threading
 from typing import List
+from collections import namedtuple
 
 from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER, set_ev_cls
@@ -18,6 +19,7 @@ from lte.protos.pipelined_pb2 import FlowResponse, SetupFlowsResult, \
     UEMacFlowRequest
 from magma.pipelined.app.base import MagmaController, ControllerType
 from magma.pipelined.app.inout import INGRESS
+from magma.pipelined.app.arp import ArpController
 from magma.pipelined.directoryd_client import update_record
 from magma.pipelined.imsi import encode_imsi, decode_imsi
 from magma.pipelined.openflow import flows
@@ -26,6 +28,9 @@ from magma.pipelined.bridge_util import BridgeTools
 from magma.pipelined.openflow.exceptions import MagmaOFError
 from magma.pipelined.openflow.magma_match import MagmaMatch
 from magma.pipelined.openflow.registers import IMSI_REG, load_passthrough
+
+
+UEInfo = namedtuple('UEInfo', ['imsi', 'mac_addr', 'ip_addr'])
 
 
 class UEMacAddressController(MagmaController):
@@ -42,15 +47,18 @@ class UEMacAddressController(MagmaController):
     def __init__(self, *args, **kwargs):
         super(UEMacAddressController, self).__init__(*args, **kwargs)
         self.tbl_num = self._service_manager.get_table_num(self.APP_NAME)
+        self.arp_tbl_num = self._service_manager.get_table_num(ArpController.APP_NAME)
+        self.arp_nxt_tbl_num = self._service_manager.get_next_table_num(ArpController.APP_NAME)
         self.next_table = \
             self._service_manager.get_table_num(INGRESS)
         self.arpd_controller_fut = kwargs['app_futures']['arpd']
-        self.arp_contoller = None
+        self.arp_controller = None
         self._datapath = None
         tbls = self._service_manager.allocate_scratch_tables(self.APP_NAME, 2)
         self._passthrough_set_tbl = tbls[0]
         self._dhcp_learn_scratch = tbls[1]
         self._li_port = None
+        self.loop = kwargs['loop']
         self._imsi_set_tbl_num = \
             self._service_manager.INTERNAL_IMSI_SET_TABLE_NUM
         self._ipfix_sample_tbl_num = \
@@ -61,10 +69,14 @@ class UEMacAddressController(MagmaController):
                 BridgeTools.get_ofport(kwargs['config']['li_local_iface'])
         self._dpi_port = \
                 BridgeTools.get_ofport(kwargs['config']['dpi']['mon_port'])
+        self.directoryd = kwargs['rpc_stubs']['directoryd']
+        self.directoryd_enabled = kwargs['config']['directoryd_enabled']
+        self.cache_size = kwargs['config']['directoryd_cache']
+        self.unhandled_learn_reqs = []
 
     def initialize_on_connect(self, datapath):
-        self.delete_all_flows(datapath)
         self._datapath = datapath
+        self.delete_all_flows(datapath)
         self._install_default_flows()
 
     def cleanup_on_disconnect(self, datapath):
@@ -83,10 +95,10 @@ class UEMacAddressController(MagmaController):
         for ue_req in ue_requests:
             self.add_ue_mac_flow(ue_req.sid.id, ue_req.mac_addr)
 
-        if self.arp_contoller or self.arpd_controller_fut.done():
-            if not self.arp_contoller:
-                self.arp_contoller = self.arpd_controller_fut.result()
-            self.arp_contoller.handle_restart(ue_requests)
+        if self.arp_controller or self.arpd_controller_fut.done():
+            if not self.arp_controller:
+                self.arp_controller = self.arpd_controller_fut.result()
+            self.arp_controller.handle_restart(ue_requests)
 
         self.init_finished = True
         return SetupFlowsResult(result=SetupFlowsResult.SUCCESS)
@@ -142,20 +154,22 @@ class UEMacAddressController(MagmaController):
             self._delete_resubmit_flow(sid, downlink_match,
                                        tbl_num=self._imsi_set_tbl_num)
 
-    def add_arp_response_flow(self, imsi, yiaddr, chaddr):
-        if self.arp_contoller or self.arpd_controller_fut.done():
-            if not self.arp_contoller:
-                self.arp_contoller = self.arpd_controller_fut.result()
-            self.arp_contoller.add_ue_arp_flows(self._datapath,
-                                                yiaddr, chaddr)
+    def add_arp_response_flow(self, records):
+        if not self.arp_controller:
+            self.arp_controller = self.arpd_controller_fut.result()
+        for ue in records:
             self.logger.debug("From DHCP learn: IMSI %s, has ip %s and mac %s",
-                              imsi, yiaddr, chaddr)
+                              ue.imsi, ue.ip_addr, ue.mac_addr)
+            self.arp_controller.add_ue_arp_flows(self._datapath, ue.ip_addr,
+                                                 ue.mac_addr)
+        del records[:]
 
-            # Associate IMSI to IPv4 addr in directory service
-            threading.Thread(target=update_record, args=(str(imsi),
-                                                         yiaddr)).start()
-        else:
-            self.logger.error("ARPD controller not ready, ARP learn FAILED")
+    def _update_directoryd_records(self, records):
+        for ue in records:
+            self.logger.debug("From DHCP learn: IMSI %s, has ip %s and mac %s",
+                              ue.imsi, ue.ip_addr, ue.mac_addr)
+            update_record(ue.imsi, ue.ip_addr, self.directoryd)
+        del records[:]
 
     def _add_resubmit_flow(self, sid, match, action=None,
                            priority=flows.DEFAULT_PRIORITY,
@@ -266,7 +280,8 @@ class UEMacAddressController(MagmaController):
                                     udp_dst=68)
         # Set so triggers packetin and we can learn the ip to do arp response
         self._add_resubmit_flow(None, downlink_match, action,
-              flows.PASSTHROUGH_PRIORITY, next_table=self._dhcp_learn_scratch,
+              flows.PASSTHROUGH_PRIORITY,
+              next_table=self._dhcp_learn_scratch,
               tbl_num=self._passthrough_set_tbl)
 
         # Install default flow for dhcp learn scratch
@@ -300,7 +315,7 @@ class UEMacAddressController(MagmaController):
         try:
             encoded_imsi = _get_encoded_imsi_from_packetin(msg)
             # Decode the imsi to properly save in directoryd
-            imsi = decode_imsi(encoded_imsi)
+            imsi = str(decode_imsi(encoded_imsi))
         except MagmaOFError as e:
             # No packet direction, but intended for this table
             self.logger.error("Error obtaining IMSI from pkt-in: %s", e)
@@ -310,7 +325,16 @@ class UEMacAddressController(MagmaController):
         dhcp_header = pkt.get_protocols(dhcp.dhcp)[0]
         # DHCP yiaddr is the client(UE) ip addr
         #      chaddr is the client mac address
-        self.add_arp_response_flow(imsi, dhcp_header.yiaddr, dhcp_header.chaddr)
+
+        self.unhandled_learn_reqs.append(UEInfo(imsi, dhcp_header.chaddr,
+                                                dhcp_header.yiaddr))
+
+        if len(self.unhandled_learn_reqs) >= self.cache_size:
+            self.loop.call_soon_threadsafe(self.add_arp_response_flow,
+                                           self.unhandled_learn_reqs[:])
+            self.loop.call_soon_threadsafe(self._update_directoryd_records,
+                                           self.unhandled_learn_reqs[:])
+            del self.unhandled_learn_reqs[:]
 
     def _install_default_flows(self):
         """
