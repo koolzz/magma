@@ -13,16 +13,18 @@ limitations under the License.
 
 import codecs
 import hashlib
-from Crypto.Cipher import ARC4
+#from Crypto.Cipher import ARC4
 
 from lte.protos.mconfig.mconfigs_pb2 import PipelineD
 
 
 def encrypt_str(s: str, key: str, encryption_algorithm):
     ret = ""
+    """
     if encryption_algorithm == PipelineD.HEConfig.RC4:
         cipher = ARC4.new(key)
         ret = cipher.encrypt(s).hex()
+    """
     return ret
 
 
